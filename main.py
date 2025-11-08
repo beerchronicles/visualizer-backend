@@ -8,6 +8,7 @@ from zipfile import ZipFile
 import pandas
 import sqlalchemy
 from fastapi import FastAPI, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from geopandas import GeoDataFrame
 from sqlalchemy import select, Sequence, delete
 from sqlalchemy.orm import Session
@@ -25,6 +26,13 @@ app.processing = False
 
 Base.metadata.create_all(engine)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def root():
