@@ -1,4 +1,5 @@
 import re
+from typing import Final
 
 import requests
 from pandas import DataFrame
@@ -31,7 +32,10 @@ point_order = [
     "dep_vdep2_5","dep_vdep10","dep_vdepmax","dep_conc"
 ]
 
-timestamp_regex = re.compile(r'\d{5}-\d+\.txt')
+timestamp_regex = re.compile(r'soft/Project/Computation/\d{5}-\d+\.txt')
+
+MSK_48_CRS: Final[
+    str] = '+proj=tmerc +lat_0=0 +lon_0=38.48333333333 +k=1 +x_0=1250000 +y_0=-5412900.566 +ellps=krass +towgs84=23.57,-140.95,-79.8,0,0.35,0.79,-0.22 +units=m +no_defs'
 
 def download_file(url, f):
     r = requests.get(url, stream=True)
