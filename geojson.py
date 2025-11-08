@@ -1,92 +1,161 @@
 from typing import Dict, Any, List
 
 import numpy as np
+from pyproj import CRS
 from shapely.geometry import box, Point, mapping
 from sqlalchemy.orm import Session
 
+import geopandas as gpd
+
 from models import ConcentrationInfo, PointSource, CadastreSource
+from processing import wgs84_point_to_crs, crs_point_to_wgs84
+from util import MSK_48_CRS
 
 
-def _median_step(sorted_vals: np.ndarray) -> float:
-    """Вычислить типичный шаг между соседними координатами.
-       Если данных мало, вернуть маленькое значение (1.0) как fallback."""
-    if len(sorted_vals) < 2:
-        return 1.0
-    diffs = np.diff(sorted_vals)
-    # отбросим нули и NaN
-    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
-    if diffs.size == 0:
-        return 1.0
-    return float(np.median(diffs))
+def _choose_project_crs_for_lonlat(lon: float, lat: float) -> CRS:
+    """
+    Рекомендуемый простой выбор проекции: локальный UTM (точнее для метрических размеров).
+    Возвращает pyproj.CRS объекта UTM зоны для данной lon/lat.
+    """
+    zone = int((lon + 180) / 6) + 1
+    is_northern = lat >= 0
+    crs_utm = CRS.from_dict({'proj': 'utm', 'zone': zone, 'south': not is_northern})
+    return crs_utm
+
+def _swap_coords_geom(geom: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Swap coordinates [lon, lat] -> [lat, lon] for Polygon/MultiPolygon GeoJSON geometry dict.
+    Returns a new geometry dict.
+    """
+    gtype = geom.get("type")
+    coords = geom.get("coordinates")
+    if gtype == "Polygon":
+        new_coords = []
+        for ring in coords:
+            new_ring = [[c[1], c[0]] for c in ring]
+            new_coords.append(new_ring)
+        return {"type": "Polygon", "coordinates": new_coords}
+    elif gtype == "MultiPolygon":
+        new_mp = []
+        for poly in coords:
+            new_poly = []
+            for ring in poly:
+                new_ring = [[c[1], c[0]] for c in ring]
+                new_poly.append(new_ring)
+            new_mp.append(new_poly)
+        return {"type": "MultiPolygon", "coordinates": new_mp}
+    elif gtype == "Point":
+        x, y = coords
+        return {"type": "Point", "coordinates": [y, x]}
+    else:
+        # generic recursive swap for other types (LineString etc.)
+        def swap_any(c):
+            if not c:
+                return c
+            if isinstance(c[0], list):
+                return [swap_any(cc) for cc in c]
+            return [[cc[1], cc[0]] for cc in c]
+        return {"type": gtype, "coordinates": swap_any(coords)}
+
 
 def generate_geojson_for_map_timestamp(
-    db_session: Session,
-    map_id: int,
-    timestamp: str,
-    include_point_sources: bool = True,
-    include_cadastre_sources: bool = True,
+        db_session: Session,
+        map_id: int,
+        timestamp: str,
+        include_point_sources: bool = True,
+        include_cadastre_sources: bool = True,
+        cell_size_m: float = 200.0,
+        use_utm: bool = True,
+        drop_zero: bool = False,
+        swap_coords: bool = True,
+        left_bottom: tuple[float, float] | None = None
 ) -> Dict[str, Any]:
     """
-    Возвращает GeoJSON FeatureCollection (как dict) для одного map_id и timestamp.
-    - Прямоугольники (cells) вокруг каждой точки concentration с полем 'value'.
-    - Точечные источники как отдельные Feature с полями.
+    Генерирует GeoJSON FeatureCollection:
+      - Для каждой записи ConcentrationInfo строит квадрат cell_size_m x cell_size_m (в метрах) вокруг точки.
+      - Добавляет point_source и cadastre_source как точки.
+    Параметры:
+      - db_session: SQLAlchemy session
+      - map_id, timestamp: фильтры
+      - cell_size_m: размер клетки в метрах (по умолчанию 200)
+      - use_utm: если True — используется локальная UTM-проекция по центру данных (более точна)
+      - drop_zero: если True — не включает ячейки с value == 0
+      - swap_coords: если True — меняет порядок координат в итоговом geojson на [lat, lon]
     """
-    # 1) Получаем концентрации
     conc_rows = (
         db_session.query(ConcentrationInfo)
         .filter(ConcentrationInfo.map_id == map_id, ConcentrationInfo.timestamp == timestamp)
         .all()
     )
-
     if not conc_rows:
-        # Возвращаем пустую FeatureCollection (фронт может отобразить сообщение)
         return {"type": "FeatureCollection", "features": []}
 
-    xs = np.array([float(r.x) for r in conc_rows])
-    ys = np.array([float(r.y) for r in conc_rows])
-    vals = np.array([float(r.value) for r in conc_rows])
-
-    # 2) вычисляем шаги по x,y (для ширины/высоты ячеек)
-    unique_x = np.unique(np.sort(xs))
-    unique_y = np.unique(np.sort(ys))
-    dx = _median_step(unique_x)
-    dy = _median_step(unique_y)
-
-    # если точки задают пересечение сетки (nodes), то половина шага вокруг точки
-    half_dx = dx / 2.0
-    half_dy = dy / 2.0
-
-    # 3) Создаём список Feature (фигур)
-    features: List[Dict[str, Any]] = []
-
-    # создать полигональные ячейки для каждой точки концентрации
+    lons = []
+    lats = []
+    props_list = []
     for r in conc_rows:
-        cx = float(r.x)
-        cy = float(r.y)
-        v = float(r.value)
-
-        # границы ячейки
-        minx = cx - half_dx
-        maxx = cx + half_dx
-        miny = cy - half_dy
-        maxy = cy + half_dy
-
-        poly = box(minx, miny, maxx, maxy)
-        prop = {
-            "type": "concentration_cell",
-            "value": v,
+        lx = float(r.x)
+        ly = float(r.y)
+        lons.append(lx)
+        lats.append(ly)
+        props_list.append({
+            "value": float(r.value),
             "map_id": int(r.map_id),
             "timestamp": str(r.timestamp),
-            # при желании можно положить info_id и другие поля:
             "info_id": int(r.info_id) if hasattr(r, "info_id") else None,
+        })
+
+    # Создаем GeoDataFrame точек в WGS84
+    gdf_pts = gpd.GeoDataFrame(props_list, geometry=[Point(xy) for xy in zip(lons, lats)], crs="EPSG:4326")
+
+    # Проекция для метрических операций
+    if use_utm:
+        center_lon = (min(lons) + max(lons)) / 2.0
+        center_lat = (min(lats) + max(lats)) / 2.0
+        proj_crs = _choose_project_crs_for_lonlat(center_lon, center_lat)
+    else:
+        proj_crs = CRS.from_epsg(3857)
+
+    gdf_m = gdf_pts.to_crs(proj_crs.to_string())
+
+    half = cell_size_m / 2.0
+    boxes = []
+    for geom in gdf_m.geometry:
+        cx, cy = geom.x, geom.y
+        b = box(cx - half, cy - half, cx + half, cy + half)
+        boxes.append(b)
+    gdf_m["geometry"] = boxes
+
+    # Обратно в EPSG:4326
+    gdf_out = gdf_m.to_crs("EPSG:4326")
+
+    features: List[Dict[str, Any]] = []
+    for _, row in gdf_out.iterrows():
+        if drop_zero and float(row["value"]) == 0.0:
+            continue
+        geom = mapping(row.geometry)  # GeoJSON-like dict
+        if swap_coords:
+            geom = _swap_coords_geom(geom)
+        prop = {
+            "type": "concentration_cell",
+            "value": row["value"],
+            "map_id": row["map_id"],
+            "timestamp": row["timestamp"],
+            "info_id": row.get("info_id"),
         }
-        features.append({"type": "Feature", "geometry": mapping(poly), "properties": prop})
+        features.append({"type": "Feature", "geometry": geom, "properties": prop})
+
+    xllcorner = 0
+    yllcorner = 0
+    if left_bottom is not None:
+        xllcorner, yllcorner = wgs84_point_to_crs(left_bottom, MSK_48_CRS)
 
     # 4) Добавляем point sources
     if include_point_sources:
         psrc_rows = db_session.query(PointSource).filter(PointSource.map_id == map_id).all()
         for p in psrc_rows:
-            geom = Point(float(p.x), float(p.y))
+            geom = crs_point_to_wgs84(Point(float(xllcorner + p.x * 200), float(yllcorner + p.y * 200)), MSK_48_CRS)
+            geom = Point(geom.y, geom.x)
             prop = {
                 "type": "point_source",
                 "id": int(p.id),
@@ -98,7 +167,8 @@ def generate_geojson_for_map_timestamp(
     if include_cadastre_sources:
         c_rows = db_session.query(CadastreSource).filter(CadastreSource.map_id == map_id).all()
         for c in c_rows:
-            geom = Point(float(c.x), float(c.y))
+            geom = crs_point_to_wgs84(Point(float(xllcorner + c.x * 200), float(yllcorner + c.y * 200)), MSK_48_CRS)
+            geom = Point(geom.y, geom.x)
             prop = {
                 "type": "cadastre_source",
                 "id": int(c.id),

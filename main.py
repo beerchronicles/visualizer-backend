@@ -34,6 +34,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+geojson_cache = {}
+
 @app.get("/health")
 async def root():
     return {"status": 200}
@@ -98,6 +100,7 @@ async def process(map_id: int):
 
         with Session(engine) as session:
             session.execute(delete(ConcentrationInfo).where(ConcentrationInfo.map_id == map_id))
+            geojson_cache.clear()
 
             statement = select(PointSource).where(PointSource.map_id == map_id)
             point_models: Sequence[PointSource] = session.scalars(statement).all()
@@ -171,5 +174,13 @@ async def get_available_timestamps(map_id: int):
 
 @app.get("/generate_geojson_timestamp")
 async def generate_geojson_timestamp(map_id: int, timestamp: str):
-    with Session(engine) as session:
-        return generate_geojson_for_map_timestamp(session, map_id, timestamp)
+    if f'{map_id}-{timestamp}' in geojson_cache:
+        return geojson_cache[f'{map_id}-{timestamp}']
+    else:
+        with Session(engine) as session:
+            statement = select(Map).where(Map.map_id == map_id)
+            map: Map = session.scalars(statement).one()
+
+            map_timestamp = generate_geojson_for_map_timestamp(session, map_id, timestamp, left_bottom = (map.lbx, map.lby))
+            geojson_cache[f'{map_id}-{timestamp}'] = map_timestamp
+            return map_timestamp

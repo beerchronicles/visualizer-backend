@@ -14,6 +14,11 @@ def wgs84_point_to_crs(point: tuple[float, float], crs: str) -> tuple[float, flo
     return cast(tuple[float, float],
                 pyproj.Transformer.from_crs('EPSG:4326', crs, always_xy=True, ).transform(*point, errcheck=True))
 
+
+def crs_point_to_wgs84(point: Point, crs: str) -> Point:
+    tup = pyproj.Transformer.from_crs(crs, 'EPSG:4326', always_xy=True).transform(point.x, point.y, errcheck=True)
+    return Point(tup[0], tup[1])
+
 def read_grid_to_geodataframe(path: str,
                               target_crs: str,
                               left_bottom: tuple[float, float] | None = None) -> tuple[geopandas.GeoDataFrame, dict]:
